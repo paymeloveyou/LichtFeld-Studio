@@ -1,0 +1,164 @@
+# Derived from the upstream Windows package workflow.
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Windows Portable Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-preflight:
+    uses: ./.github/workflows/windows-build-preflight.yml
+
+  build-windows:
+    needs: windows-preflight
+    runs-on: windows-2022
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
+      VCPKG_BUILD_TYPE: release
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+      BUILD_DIR: b
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install CUDA 12.8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda-12.8.exe'
+          Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe' -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '-y -s -accepteula -toolkit -override -noDisplayDriver' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -notin @(0, 3010)) { throw "CUDA installer failed: $($process.ExitCode)" }
+          Remove-Item -LiteralPath $installer -Force
+          $nvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+          if (-not (Test-Path -LiteralPath $nvcc)) { throw 'CUDA compiler was not installed' }
+          & $nvcc --version
+          "CUDA_PATH_V12_8=$env:CUDA_PATH" >> $env:GITHUB_ENV
+          "$env:CUDA_PATH\bin" >> $env:GITHUB_PATH
+
+      - name: Normalize vcpkg path
+        run: '"VCPKG_ROOT=$([System.IO.Path]::GetFullPath($env:VCPKG_ROOT))" >> $env:GITHUB_ENV'
+
+      - name: Cache vcpkg tool
+        id: cache-vcpkg-tool
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tool-${{ runner.os }}-portable-v1
+
+      - name: Setup vcpkg
+        if: steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-portable-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-portable-v1-
+
+      - name: Configure Release portable build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          cmake -B %BUILD_DIR% -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF -DLFS_DEV_IMPORT_SOURCE_PYTHON=OFF -DLFS_DEV_IMPORT_SOURCE_RESOURCES=OFF
+
+      - name: Generate shader headers
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          set PATH=%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
+          cmake --build %BUILD_DIR% --target lfs_shader_headers --config Release -j 4
+
+      - name: Check MSVC compilation contracts
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          python tools\windows_build_preflight.py --skip-source-checks --compile-commands %BUILD_DIR%\compile_commands.json --max-commands 512
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          set PATH=%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
+          cmake --build %BUILD_DIR% --parallel 4
+
+      - name: Package executable, runtime libraries and resources
+        id: package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --install $env:BUILD_DIR --prefix dist --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Join-Path $PWD 'dist\bin\LichtFeld-Studio.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Missing executable: $exe" }
+          foreach ($required in @('dist\bin\nvjpeg2k_0.dll', 'dist\LICENSE')) {
+            if (-not (Test-Path -LiteralPath $required)) { throw "Missing package file: $required" }
+          }
+          $shortSha = (git rev-parse --short HEAD).Trim()
+          $packageName = "LichtFeld-Studio-windows-x64-$shortSha.zip"
+          Compress-Archive -Path dist\* -DestinationPath $packageName
+          $checksum = (Get-FileHash -Algorithm SHA256 -LiteralPath $packageName).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$packageName.sha256" -Value "$checksum  $packageName" -Encoding ascii
+          "package_name=$packageName" >> $env:GITHUB_OUTPUT
+          "artifact_name=LichtFeld-Studio-windows-x64-$shortSha" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Windows portable package
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.package_name }}
+            ${{ steps.package.outputs.package_name }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Write download instructions
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          @"
+          ### Windows portable package
+          Download: $env:ARTIFACT_URL
+
+          Extract the artifact, then extract the LichtFeld-Studio ZIP and run bin/LichtFeld-Studio.exe.
+          Keep all DLLs and resources together. NVIDIA compute capability 7.5+ and driver 570+ are required.
+          Source commit: $env:GITHUB_SHA
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-build-diagnostics-${{ github.run_number }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ env.BUILD_DIR }}/CMakeCache.txt
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.BUILD_DIR }}/vcpkg-manifest-install.log
+            ${{ env.BUILD_DIR }}/vcpkg_installed/vcpkg/issue_body.md
+            ${{ env.BUILD_DIR }}/vcpkg_installed/vcpkg/blds/**/*.log
